@@ -249,16 +249,27 @@ impl RgbaLayerTextureCache {
 }
 
 impl NativePreviewSession {
-    pub fn new(gpu: Arc<GpuContext>) -> Self {
+    pub fn new(gpu: Arc<GpuContext>) -> Result<Self, String> {
+        gpu.mark_phase("compositor_yuv_bind_group_layout");
         let yuv_layout = create_yuv_hdr_bind_group_layout(&gpu.device);
+        gpu.checkpoint("after_compositor_yuv_bind_group_layout")?;
+
+        gpu.mark_phase("compositor_sampler");
         let sampler = create_yuv_hdr_sampler(&gpu.device);
+        gpu.checkpoint("after_compositor_sampler")?;
+
+        gpu.mark_phase("compositor_yuv_pipeline");
         let pipeline = create_yuv_hdr_render_pipeline(
             &gpu.device,
             &yuv_layout,
             wgpu::TextureFormat::Rgba8UnormSrgb,
         );
+        gpu.checkpoint("after_compositor_yuv_pipeline")?;
+
+        gpu.mark_phase("compositor_text_pipeline");
         let text_pipeline =
             TextEffectPipeline::new(&gpu.device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        gpu.checkpoint("after_compositor_text_pipeline")?;
         let text_cache = TextLayerCache::new(TEXT_LAYER_CACHE_BYTES);
         let dxgi_state = if gpu.capabilities.zero_copy_available() {
             DxgiImportState::Unknown
@@ -267,9 +278,11 @@ impl NativePreviewSession {
                 reason: DisableReason::UnsupportedFeature,
             }
         };
+        gpu.mark_phase("compositor_transparent_mask");
         let transparent_mask_placeholder = Self::create_transparent_mask_placeholder(&gpu);
+        gpu.checkpoint("after_compositor_transparent_mask")?;
 
-        Self {
+        Ok(Self {
             gpu,
             dxgi_state,
             yuv_layout,
@@ -286,7 +299,7 @@ impl NativePreviewSession {
             compositors: Vec::new(),
             capability_policy: None,
             capability_probe_us: None,
-        }
+        })
     }
 
     pub fn mark_dxgi_failed(&mut self, reason: DxgiFailureReason) {
@@ -309,10 +322,10 @@ impl NativePreviewSession {
     /// `configure_native_playback_render` after `probe_decode_capability`.
     pub fn set_capability_probe(
         &mut self,
-        policy: crate::native_core::DecodeCapabilityPolicy,
+        policy: Option<crate::native_core::DecodeCapabilityPolicy>,
         probe_us: Option<u64>,
     ) {
-        self.capability_policy = Some(policy);
+        self.capability_policy = policy;
         self.capability_probe_us = probe_us;
     }
 
@@ -329,6 +342,12 @@ impl NativePreviewSession {
     }
 
     pub fn reset_dxgi_state(&mut self) {
+        if self.gpu.is_device_lost() {
+            log::warn!(
+                "[NativePreviewSession] retaining DXGI failure after project reset because the GPU device is removed; a new GPU context is required before retrying native rendering"
+            );
+            return;
+        }
         self.dxgi_state = DxgiImportState::Unknown;
     }
 
@@ -2467,8 +2486,11 @@ mod tests {
             queue: renderer.queue,
             nv12_supported,
             dxgi_adapter_index: None,
+            device_loss: Arc::new(
+                crate::wgpu_compositor::adapter_selector::DeviceLossState::default(),
+            ),
         });
-        let mut session = NativePreviewSession::new(gpu);
+        let mut session = NativePreviewSession::new(gpu).expect("native preview session init");
         let source_width = 64u32;
         let source_height = 64u32;
         let output_width = 32u32;
@@ -2597,9 +2619,13 @@ mod tests {
             queue: renderer.queue,
             nv12_supported,
             dxgi_adapter_index: None,
+            device_loss: Arc::new(
+                crate::wgpu_compositor::adapter_selector::DeviceLossState::default(),
+            ),
         });
 
-        let mut session = NativePreviewSession::new(gpu.clone());
+        let mut session =
+            NativePreviewSession::new(gpu.clone()).expect("native preview session init");
         let params = ColorTransformUniforms {
             color_space: 0,
             range: if color.range == "full" { 1 } else { 0 },

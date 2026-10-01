@@ -24,14 +24,14 @@ use crate::wgpu_compositor::multi_track_composer::TransitionUniforms;
 use crate::wgpu_compositor::DxgiImportState;
 use crate::wgpu_compositor::{
     BlendMode, BodyEffectUniforms, ChromaKeyUniforms, ColorGradeUniforms, ColorTransformUniforms,
-    CompositeLayer, CropMargins, FrameRenderPath, LayerTransform, NativePreviewSession,
-    NativeWgpuRenderer,
+    CompositeLayer, CropMargins, FrameRenderPath, GpuContext, LayerTransform,
+    NativePreviewSession, NativeWgpuRenderer,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{Emitter, Manager};
 
@@ -39,6 +39,57 @@ use crate::thumbnail_engine::stream_actor::DecodedVideoPlanes;
 
 type DecodedNativeVideoFrame = (DecodedVideoPlanes, u32, u32, VideoColorMetadata, u32);
 static NATIVE_SURFACE_PRESENTATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static LAST_FRAME_PRESENTATION_DIAGNOSTIC: Mutex<Option<String>> = Mutex::new(None);
+
+/// Stop native-GPU work once the underlying device has been removed.  A DXGI
+/// import can remove the D3D12 device before wgpu's asynchronous callback has
+/// run, so callers use the sticky `GpuContext` state as the guard between
+/// native operations.  The existing CPU-NV12 path remains the selected
+/// transfer path for a healthy context; it must not be attempted on the
+/// removed device because its upload still creates/writes wgpu resources.
+fn ensure_native_gpu_healthy(gpu: &GpuContext, phase: &str) -> Result<(), String> {
+    if !gpu.is_device_lost() {
+        return Ok(());
+    }
+
+    let detail = gpu
+        .device_loss_diagnostic()
+        .map(|diagnostic| {
+            format!(
+                "phase={} reason={} message={}",
+                diagnostic.phase, diagnostic.reason, diagnostic.message
+            )
+        })
+        .unwrap_or_else(|| "device-loss diagnostic unavailable".to_string());
+    let message = format!(
+        "Native GPU operation '{phase}' was skipped after device removal ({detail}); DX12 zero-copy is disabled and CPU-NV12 upload will be used only by a healthy GPU context"
+    );
+    log::error!("[NativePreviewSession] {message}");
+    Err(message)
+}
+
+/// Emit one diagnostic record for each distinct presentation configuration.
+///
+/// The signature deliberately excludes frame time so active playback does not
+/// flood the terminal, while still making mode, quality, dimensions, backend,
+/// and transfer-path changes visible when comparing playback with paused
+/// preview.
+fn log_frame_presentation_diagnostic(signature: String) {
+    let should_log = LAST_FRAME_PRESENTATION_DIAGNOSTIC
+        .lock()
+        .map(|mut last| {
+            if last.as_deref() == Some(signature.as_str()) {
+                false
+            } else {
+                *last = Some(signature.clone());
+                true
+            }
+        })
+        .unwrap_or(true);
+    if should_log {
+        log::info!("[preview-diag][frame] {signature}");
+    }
+}
 
 /// Register an editor font before a frame request references it. The native
 /// renderer never substitutes a different family for an unregistered font.
@@ -601,6 +652,7 @@ pub(crate) async fn prepare_native_preview_pipelines(
         .ok_or_else(|| "Native preview GPU session is unavailable".to_string())?;
     let preview_session = preview_state.inner().clone();
     let mut session = preview_session.lock().await;
+    ensure_native_gpu_healthy(&session.gpu, "pipeline_warmup")?;
     // The Windows native surface always presents Bgra8UnormSrgb. Do not warm
     // an RGBA readback graph as part of this latency-critical path: each graph
     // eagerly creates five blend/transition pipelines, and Intel D3D12 drivers
@@ -1625,6 +1677,7 @@ pub async fn render_native_preview_frame(
     let rgba = if let Some(state) = app.try_state::<Arc<tokio::sync::Mutex<NativePreviewSession>>>()
     {
         let mut session = state.lock().await;
+        ensure_native_gpu_healthy(&session.gpu, "preview_frame_upload")?;
         session
             .render_nv12_frame(
                 width,
@@ -1665,6 +1718,7 @@ pub async fn render_native_project_frame(
         .try_state::<Arc<tokio::sync::Mutex<NativePreviewSession>>>()
         .ok_or_else(|| "Native preview GPU session is unavailable".to_string())?;
     let mut session = state.lock().await;
+    ensure_native_gpu_healthy(&session.gpu, "frame_setup")?;
     let gpu = Arc::clone(&session.gpu);
     let compositor = session.get_or_create_compositor(
         request.canvas_width,
@@ -1972,11 +2026,13 @@ async fn render_native_video_project_frame_bytes_timed(
     };
 
     let mut session = state.lock().await;
+    ensure_native_gpu_healthy(&session.gpu, "frame_setup")?;
     let gpu = Arc::clone(&session.gpu);
     let conversion_started = Instant::now();
 
     #[allow(unused_mut)]
     let mut render_path = FrameRenderPath::GpuUploadRing;
+    let mut source_dimensions = String::new();
 
     #[cfg(target_os = "windows")]
     let can_use_dxgi = session.gpu.capabilities.zero_copy_available()
@@ -2010,6 +2066,8 @@ async fn render_native_video_project_frame_bytes_timed(
                             break;
                         }
                     };
+                    ensure_native_gpu_healthy(&session.gpu, "dxgi_zero_copy_import")?;
+                    session.gpu.mark_phase("dxgi_zero_copy_import");
                     match dxgi_import::import_into_wgpu(&session.gpu.device, shared) {
                         Ok(imported) => {
                             match session.render_nv12_from_imported_texture(
@@ -2040,6 +2098,24 @@ async fn render_native_video_project_frame_bytes_timed(
                             }
                         }
                         Err(reason) => {
+                            if matches!(
+                                reason,
+                                crate::wgpu_compositor::DxgiFailureReason::DeviceLost
+                            ) {
+                                session.gpu.mark_device_lost(
+                                    "dxgi_zero_copy_import",
+                                    "DXGI_ERROR_DEVICE_REMOVED / DXGI_ERROR_DRIVER_INTERNAL_ERROR",
+                                    "ID3D12Device::OpenSharedHandle removed the DX12 device",
+                                );
+                                session.mark_dxgi_failed(reason);
+                                crate::wgpu_compositor::adapter_selector::mark_dxgi_runtime_disabled();
+                                log::error!(
+                                    "[NativePreviewSession] DX12 zero-copy disabled after OpenSharedHandle caused DXGI device removal; aborting the current frame before CPU-NV12 upload or any further wgpu work"
+                                );
+                                return Err(
+                                    "DX12 zero-copy disabled: OpenSharedHandle caused DXGI device removal; CPU-NV12 upload requires a healthy GPU context and the current frame was aborted to prevent use-after-device-loss".to_string(),
+                                );
+                            }
                             session.mark_dxgi_failed(reason);
                             import_all_ok = false;
                             break;
@@ -2068,10 +2144,16 @@ async fn render_native_video_project_frame_bytes_timed(
         // another already-decoded preview frame from submitting work.
         drop(session);
         let (decoded_frames, decode_timings) = decode_native_video_layers(&request, None).await?;
+        source_dimensions = decoded_frames
+            .iter()
+            .map(|(_, width, height, _, rotation)| format!("{}x{}@rot{}", width, height, rotation))
+            .collect::<Vec<_>>()
+            .join(",");
         decode_time_us = decode_timings.decode_time_us;
         decoder_mutex_wait_us = decode_timings.decoder_mutex_wait_us;
 
         session = state.lock().await;
+        ensure_native_gpu_healthy(&session.gpu, "cpu_nv12_upload")?;
         for (layer, (planes, width, height, color, source_rotation)) in
             request.layers.iter().zip(decoded_frames.iter())
         {
@@ -2091,15 +2173,41 @@ async fn render_native_video_project_frame_bytes_timed(
                     && crate::wgpu_compositor::adapter_selector::is_dxgi_runtime_enabled()
                 {
                     if let Some(duped_shared) = shared_arc.duplicate() {
-                        if let Ok(imported) = crate::wgpu_compositor::dxgi_import::import_into_wgpu(
+                        ensure_native_gpu_healthy(&session.gpu, "dxgi_zero_copy_import")?;
+                        session.gpu.mark_phase("dxgi_zero_copy_import");
+                        match crate::wgpu_compositor::dxgi_import::import_into_wgpu(
                             &session.gpu.device,
                             duped_shared,
                         ) {
-                            if let Ok(texture) = session.render_nv12_from_imported_texture(
-                                layer_key, *width, *height, &imported, &params,
-                            ) {
-                                session.mark_dxgi_supported();
-                                layer_texture = Some(texture);
+                            Ok(imported) => {
+                                if let Ok(texture) = session.render_nv12_from_imported_texture(
+                                    layer_key, *width, *height, &imported, &params,
+                                ) {
+                                    session.mark_dxgi_supported();
+                                    layer_texture = Some(texture);
+                                }
+                            }
+                            Err(reason) => {
+                                if matches!(
+                                    reason,
+                                    crate::wgpu_compositor::DxgiFailureReason::DeviceLost
+                                ) {
+                                    session.gpu.mark_device_lost(
+                                        "dxgi_zero_copy_import",
+                                        "DXGI_ERROR_DEVICE_REMOVED / DXGI_ERROR_DRIVER_INTERNAL_ERROR",
+                                        "ID3D12Device::OpenSharedHandle removed the DX12 device",
+                                    );
+                                    session.mark_dxgi_failed(reason);
+                                    crate::wgpu_compositor::adapter_selector::mark_dxgi_runtime_disabled();
+                                    log::error!(
+                                        "[NativePreviewSession] DX12 zero-copy disabled after OpenSharedHandle caused DXGI device removal; aborting before CPU-NV12 upload or any further wgpu work"
+                                    );
+                                    return Err(
+                                        "DX12 zero-copy disabled: OpenSharedHandle caused DXGI device removal; CPU-NV12 upload requires a healthy GPU context and the current frame was aborted to prevent use-after-device-loss".to_string(),
+                                    );
+                                }
+                                session.mark_dxgi_failed(reason);
+                                crate::wgpu_compositor::adapter_selector::mark_dxgi_runtime_disabled();
                             }
                         }
                     }
@@ -2109,9 +2217,29 @@ async fn render_native_video_project_frame_bytes_timed(
             let texture = match layer_texture {
                 Some(t) => t,
                 None => {
-                    let (y_plane, uv_plane) = planes.cpu_planes().ok_or_else(|| {
-                        "CPU fallback planes unavailable for preview rendering".to_string()
-                    })?;
+                    ensure_native_gpu_healthy(&session.gpu, "cpu_nv12_upload")?;
+                    let (y_plane, uv_plane) = match planes.cpu_planes() {
+                        Some(planes) => planes,
+                        None => {
+                            log_frame_presentation_diagnostic(format!(
+                                "stage=readback-failed backend={} adapter='{}' mode={:?} quality={:?} render_path={:?} source={} reason=cpu-fallback-planes-unavailable",
+                                gpu.info.backend,
+                                gpu.info.name,
+                                request.mode,
+                                request.quality,
+                                render_path,
+                                if source_dimensions.is_empty() {
+                                    "none"
+                                } else {
+                                    source_dimensions.as_str()
+                                },
+                            ));
+                            return Err(
+                                "CPU fallback planes unavailable for preview rendering"
+                                    .to_string(),
+                            );
+                        }
+                    };
 
                     // Rotate NV12 pixels to upright orientation when the source has a
                     // non-zero display rotation (e.g. portrait Pixel video stored landscape).
@@ -2353,6 +2481,23 @@ async fn render_native_video_project_frame_bytes_timed(
                 )
                 .await?
         };
+    log_frame_presentation_diagnostic(format!(
+        "surface=readback backend={} adapter='{}' mode={:?} quality={:?} render_path={:?} source={} request_output={}x{} canvas={}x{}",
+        gpu.info.backend,
+        gpu.info.name,
+        request.mode,
+        request.quality,
+        render_path,
+        if source_dimensions.is_empty() {
+            "none"
+        } else {
+            source_dimensions.as_str()
+        },
+        request.canvas_width,
+        request.canvas_height,
+        request.canvas_width,
+        request.canvas_height,
+    ));
     Ok((
         rgba,
         NativeRenderStageTimings {
@@ -2930,6 +3075,7 @@ pub async fn register_native_raster_asset(
         .try_state::<Arc<tokio::sync::Mutex<NativePreviewSession>>>()
         .ok_or_else(|| "Native preview GPU session is unavailable".to_string())?;
     let mut session = preview_state.lock().await;
+    ensure_native_gpu_healthy(&session.gpu, "raster_asset_upload")?;
     session
         .get_or_upload_rgba_layer_to_texture(
             &asset.asset_id,
@@ -2997,6 +3143,7 @@ pub async fn register_native_raster_asset_raw(
         .try_state::<Arc<tokio::sync::Mutex<NativePreviewSession>>>()
         .ok_or_else(|| "Native preview GPU session is unavailable".to_string())?;
     let mut session = preview_state.lock().await;
+    ensure_native_gpu_healthy(&session.gpu, "raster_asset_upload")?;
     session
         .get_or_upload_rgba_layer_to_texture(&asset_id, width, height, Some(raw_rgba))
         .map(|_| ())
@@ -3047,6 +3194,7 @@ pub async fn register_native_image_asset(
     .map_err(|error| format!("Native image decode task failed: {}", error))??;
 
     let mut session = preview_state.lock().await;
+    ensure_native_gpu_healthy(&session.gpu, "image_asset_upload")?;
     session
         .get_or_upload_rgba_layer_to_texture(&asset_id, width, height, Some(&rgba))
         .map(|_| ())
@@ -3289,6 +3437,7 @@ pub(crate) async fn present_native_frame_internal(
     let (capability_policy_value, capability_probe_us_value) = session.capability_probe();
     let capability_policy_str = capability_policy_value.map(|p| p.as_str().to_string());
     let gpu = Arc::clone(&session.gpu);
+    ensure_native_gpu_healthy(&gpu, "native_surface_setup")?;
     let mut surface = surface_state.lock().unwrap_or_else(|poisoned| {
         let mut state = poisoned.into_inner();
         state.handle_poison_recovery("present_native_frame_internal:present");
@@ -3414,6 +3563,27 @@ pub(crate) async fn present_native_frame_internal(
             "Native direct presentation requires an 8-bit RGBA/BGRA surface format, got {target_format:?}"
         ));
     }
+    let source_dimensions = decoded_frames
+        .iter()
+        .map(|(_, width, height, _, rotation)| format!("{}x{}@rot{}", width, height, rotation))
+        .collect::<Vec<_>>()
+        .join(",");
+    log_frame_presentation_diagnostic(format!(
+        "stage=native-surface-attempt backend={} adapter='{}' mode={:?} quality={:?} source={} request_output={}x{} surface_format={:?} zero_copy_capable={}",
+        gpu.info.backend,
+        gpu.info.name,
+        request.mode,
+        request.quality,
+        if source_dimensions.is_empty() {
+            "none"
+        } else {
+            source_dimensions.as_str()
+        },
+        request.output_width,
+        request.output_height,
+        target_format,
+        gpu.capabilities.zero_copy_available(),
+    ));
     // Warn once if we are presenting to a non-sRGB surface — colours will be
     // slightly different from the sRGB path but the preview will be visible.
     // This commonly occurs on Windows with certain WDDM drivers that do not
@@ -3422,10 +3592,13 @@ pub(crate) async fn present_native_frame_internal(
     // back-buffer acquisition while it is hidden. Reveal it before acquiring
     // the swapchain texture so the production first frame follows the same
     // path as subsequent frames.
+    ensure_native_gpu_healthy(&gpu, "native_surface_configuration")?;
     surface.show_surface()?;
     let surface_acquire_started = Instant::now();
-    let surface_texture = surface.acquire_current_texture(&gpu.device)?;
+    let surface_texture = surface.acquire_current_texture(&gpu)?;
     let surface_acquire_us = surface_acquire_started.elapsed().as_micros() as u64;
+    let surface_width = surface_texture.texture.width();
+    let surface_height = surface_texture.texture.height();
     let target_view = surface_texture
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
@@ -3475,6 +3648,8 @@ pub(crate) async fn present_native_frame_internal(
                     && crate::wgpu_compositor::adapter_selector::is_dxgi_runtime_enabled()
                 {
                     if let Some(duped_shared) = shared_arc.duplicate() {
+                        ensure_native_gpu_healthy(&session.gpu, "dxgi_zero_copy_import")?;
+                        session.gpu.mark_phase("dxgi_zero_copy_import");
                         match crate::wgpu_compositor::dxgi_import::import_into_wgpu(
                             &session.gpu.device,
                             duped_shared,
@@ -3510,6 +3685,24 @@ pub(crate) async fn present_native_frame_internal(
                                 log::warn!(
                                     "[NativePreviewSession] import_into_wgpu failed: {reason:?}"
                                 );
+                                if matches!(
+                                    reason,
+                                    crate::wgpu_compositor::DxgiFailureReason::DeviceLost
+                                ) {
+                                    session.gpu.mark_device_lost(
+                                        "dxgi_zero_copy_import",
+                                        "DXGI_ERROR_DEVICE_REMOVED / DXGI_ERROR_DRIVER_INTERNAL_ERROR",
+                                        "ID3D12Device::OpenSharedHandle removed the DX12 device",
+                                    );
+                                    session.mark_dxgi_failed(reason);
+                                    crate::wgpu_compositor::adapter_selector::mark_dxgi_runtime_disabled();
+                                    log::error!(
+                                        "[NativePreviewSession] DX12 zero-copy disabled after OpenSharedHandle caused DXGI device removal; aborting the current frame before CPU-NV12 upload or any further wgpu work"
+                                    );
+                                    return Err(
+                                        "DX12 zero-copy disabled: OpenSharedHandle caused DXGI device removal; CPU-NV12 upload requires a healthy GPU context and the current frame was aborted to prevent use-after-device-loss".to_string(),
+                                    );
+                                }
                                 session.mark_dxgi_failed(reason);
                                 crate::wgpu_compositor::adapter_selector::mark_dxgi_runtime_disabled();
                             }
@@ -3518,6 +3711,7 @@ pub(crate) async fn present_native_frame_internal(
                 }
             }
 
+            ensure_native_gpu_healthy(&session.gpu, "cpu_nv12_upload")?;
             let texture = match layer_texture {
                 Some(t) => {
                     used_dxgi_zero_copy = true;
@@ -3550,6 +3744,18 @@ pub(crate) async fn present_native_frame_internal(
                     }
                     None => {
                         crate::wgpu_compositor::adapter_selector::mark_dxgi_runtime_disabled();
+                        log_frame_presentation_diagnostic(format!(
+                            "stage=native-surface-failed backend={} adapter='{}' mode={:?} quality={:?} source={} reason=cpu-fallback-planes-unavailable",
+                            gpu.info.backend,
+                            gpu.info.name,
+                            request.mode,
+                            request.quality,
+                            if source_dimensions.is_empty() {
+                                "none"
+                            } else {
+                                source_dimensions.as_str()
+                            },
+                        ));
                         return Err(
                             "DXGI zero-copy texture import failed and no CPU planes cached"
                                 .to_string(),
@@ -3613,6 +3819,30 @@ pub(crate) async fn present_native_frame_internal(
         used_dxgi_zero_copy,
         used_cpu_nv12,
     );
+    log_frame_presentation_diagnostic(format!(
+        "stage=native-presented surface=native backend={} adapter='{}' mode={:?} quality={:?} transfer_path={} source={} request_output={}x{} canvas={}x{} surface_texture={}x{} zero_copy={} cpu_nv12={} queue_hit={} frame_index={}",
+        gpu.info.backend,
+        gpu.info.name,
+        request.mode,
+        request.quality,
+        transfer_path,
+        if source_dimensions.is_empty() {
+            "none"
+        } else {
+            source_dimensions.as_str()
+        },
+        request.output_width,
+        request.output_height,
+        legacy_request.canvas_width,
+        legacy_request.canvas_height,
+        surface_width,
+        surface_height,
+        used_dxgi_zero_copy,
+        used_cpu_nv12,
+        queue_hit,
+        request.frame_time.frame_index,
+    ));
+    ensure_native_gpu_healthy(&gpu, "native_compositor_setup")?;
     let compose_started = Instant::now();
     let compositor_was_warm = session.has_compositor(
         legacy_request.canvas_width,
@@ -3727,6 +3957,7 @@ pub(crate) async fn present_native_frame_internal(
         b: legacy_request.clear_color[2].clamp(0.0, 1.0) as f64,
         a: legacy_request.clear_color[3].clamp(0.0, 1.0) as f64,
     };
+    ensure_native_gpu_healthy(&gpu, "native_compositor_render")?;
     if let Some(transition) = legacy_request.transition.as_ref() {
         let (from_layer, to_layer) = build_transition_sources(&legacy_request, &layers)?;
         let from_texture = create_transition_source_texture(
@@ -3780,6 +4011,7 @@ pub(crate) async fn present_native_frame_internal(
     let compose_us = compose_started.elapsed().as_micros() as u64;
     // Keep decoded textures and views alive until after queue submission.
     let _textures = textures;
+    ensure_native_gpu_healthy(&gpu, "native_surface_present")?;
     let submit_present_started = Instant::now();
     surface_texture.present();
     let submit_present_us = submit_present_started.elapsed().as_micros() as u64;

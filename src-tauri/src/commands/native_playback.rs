@@ -1036,20 +1036,140 @@ pub fn configure_native_playback(
     with_runtime(&app, |runtime| runtime.configure(plan))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeCapabilityProbeOutcome {
+    /// The decoder completed the probe and the elapsed time was mapped to a
+    /// capability policy. This is the only outcome allowed to lower the
+    /// requested playback tier based on measured performance.
+    Measured(DecodeCapabilityPolicy),
+    /// No video layer or decoder was available, so no capability measurement
+    /// was made. Preserve the caller's requested quality in this case.
+    Unavailable,
+    /// The decoder was available but could not produce the probe frame. A
+    /// decode failure is not evidence that the GPU can only sustain proxy
+    /// quality, so preserve the caller's requested quality.
+    Failed,
+    /// DXGI zero-copy was not eligible for the hardware frame, so playback
+    /// will use the healthy CPU-NV12 transport.  Transport availability is
+    /// not a decode-resolution measurement; preserve the requested tier.
+    CpuNv12Fallback,
+    /// A stuck decoder is a real capability constraint for this session. Keep
+    /// the existing conservative timeout policy and select Proxy before the
+    /// first frame is queued.
+    TimedOut,
+}
+
+impl DecodeCapabilityProbeOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Measured(_) => "measured",
+            Self::Unavailable => "unavailable",
+            Self::Failed => "failed",
+            Self::CpuNv12Fallback => "cpu-nv12-fallback",
+            Self::TimedOut => "timed-out",
+        }
+    }
+
+    fn policy(self) -> Option<DecodeCapabilityPolicy> {
+        match self {
+            Self::Measured(policy) => Some(policy),
+            Self::Unavailable | Self::Failed | Self::CpuNv12Fallback | Self::TimedOut => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DecodeCapabilityProbe {
+    outcome: DecodeCapabilityProbeOutcome,
+    elapsed_us: Option<u64>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeCapabilityProbePath {
+    DxgiZeroCopy,
+    CpuNv12Fallback,
+    CpuNv12Measured,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlaybackQualityDecision {
+    selected: QualityTier,
+    reason: &'static str,
+}
+
+fn merge_requested_quality_with_probe(
+    requested: QualityTier,
+    outcome: DecodeCapabilityProbeOutcome,
+) -> PlaybackQualityDecision {
+    let Some(policy) = outcome.policy() else {
+        return PlaybackQualityDecision {
+            selected: match outcome {
+                DecodeCapabilityProbeOutcome::TimedOut => match requested {
+                    QualityTier::Proxy | QualityTier::Quarter => requested,
+                    QualityTier::Half => QualityTier::Quarter,
+                    QualityTier::Full => QualityTier::Quarter,
+                },
+                DecodeCapabilityProbeOutcome::Unavailable
+                | DecodeCapabilityProbeOutcome::Failed
+                | DecodeCapabilityProbeOutcome::CpuNv12Fallback
+                | DecodeCapabilityProbeOutcome::Measured(_) => requested,
+            },
+            reason: match outcome {
+                DecodeCapabilityProbeOutcome::Unavailable => {
+                    "probe unavailable; preserving requested tier"
+                }
+                DecodeCapabilityProbeOutcome::Failed => {
+                    "probe failed to decode; preserving requested tier"
+                }
+                DecodeCapabilityProbeOutcome::CpuNv12Fallback => {
+                    "DXGI zero-copy unavailable; preserving requested tier for CPU-NV12 fallback"
+                }
+                DecodeCapabilityProbeOutcome::TimedOut => {
+                    "probe timed out; applying conservative proxy tier"
+                }
+                DecodeCapabilityProbeOutcome::Measured(_) => "requested tier preserved",
+            },
+        };
+    };
+
+    let probe_quality = policy.lookahead_quality();
+    let selected = match (requested, probe_quality) {
+        (QualityTier::Proxy, _) | (_, QualityTier::Proxy) => QualityTier::Proxy,
+        (QualityTier::Quarter, _) | (_, QualityTier::Quarter) => QualityTier::Quarter,
+        (QualityTier::Half, _) | (_, QualityTier::Half) => QualityTier::Half,
+        _ => QualityTier::Full,
+    };
+
+    PlaybackQualityDecision {
+        selected,
+        reason: if selected != requested {
+            "measured capability is below requested tier"
+        } else {
+            "requested tier is within measured capability"
+        },
+    }
+}
+
 /// Probe the hardware's decode capability for the first video layer in the
 /// snapshot. Decodes one keyframe at `time_secs = 0.0` with
 /// `allow_keyframe_approx: true` and maps the elapsed wall-clock time to a
-/// `DecodeCapabilityPolicy`. The probe is bounded by a 400 ms Tokio timeout;
-/// if the decoder does not return within that window the policy is `Proxy`.
+/// `DecodeCapabilityPolicy`. The probe is bounded by a 400 ms Tokio timeout.
 ///
 /// The probe runs after `prepare_native_preview_pipelines` (GPU warm) and
 /// before `schedule_lookahead_predecode`. It must not be spawned in the
 /// background; awaiting it is what makes the quality policy available before
 /// the first lookahead frame is queued.
-async fn probe_decode_capability(snapshot: &FrameRequest) -> (DecodeCapabilityPolicy, Option<u64>) {
+async fn probe_decode_capability(snapshot: &FrameRequest) -> DecodeCapabilityProbe {
     let layer = match snapshot.project.video_layers.first() {
         Some(layer) => layer,
-        None => return (DecodeCapabilityPolicy::Full, None),
+        None => {
+            return DecodeCapabilityProbe {
+                outcome: DecodeCapabilityProbeOutcome::Unavailable,
+                elapsed_us: None,
+                detail: Some("snapshot has no video layers".to_string()),
+            }
+        }
     };
 
     let stream_id = if !layer.layer_id.is_empty() {
@@ -1060,7 +1180,13 @@ async fn probe_decode_capability(snapshot: &FrameRequest) -> (DecodeCapabilityPo
 
     let decoder = match get_preview_decoder_for_stream(&layer.video_path, stream_id).await {
         Ok(d) => d,
-        Err(_) => return (DecodeCapabilityPolicy::Full, None),
+        Err(error) => {
+            return DecodeCapabilityProbe {
+                outcome: DecodeCapabilityProbeOutcome::Unavailable,
+                elapsed_us: None,
+                detail: Some(error),
+            }
+        }
     };
 
     let probe_options = crate::thumbnail_engine::decoder::DecodeFrameOptions {
@@ -1075,7 +1201,32 @@ async fn probe_decode_capability(snapshot: &FrameRequest) -> (DecodeCapabilityPo
         std::time::Duration::from_millis(400),
         tokio::task::spawn_blocking(move || {
             let mut guard = decoder.blocking_lock();
-            guard.decode_frame_raw_nv12_with_options(0.0, probe_options, || false)
+            #[cfg(target_os = "windows")]
+            if guard.is_hardware_accelerated() {
+                let mut frame_color = crate::thumbnail_engine::decoder::VideoColorMetadata::default();
+                let mut width = 0u32;
+                let mut height = 0u32;
+                return guard
+                    .decode_frame_dxgi_windows(
+                        0.0,
+                        probe_options,
+                        || false,
+                        &mut frame_color,
+                        &mut width,
+                        &mut height,
+                    )
+                    .map(|shared| {
+                        if shared.is_some() {
+                            DecodeCapabilityProbePath::DxgiZeroCopy
+                        } else {
+                            DecodeCapabilityProbePath::CpuNv12Fallback
+                        }
+                    });
+            }
+
+            guard
+                .decode_frame_raw_nv12_with_options(0.0, probe_options, || false)
+                .map(|_| DecodeCapabilityProbePath::CpuNv12Measured)
         }),
     )
     .await;
@@ -1083,12 +1234,39 @@ async fn probe_decode_capability(snapshot: &FrameRequest) -> (DecodeCapabilityPo
     let elapsed_us = started.elapsed().as_micros() as u64;
 
     match result {
-        Ok(Ok(Ok(_))) => (
-            DecodeCapabilityPolicy::from_probe_us(elapsed_us),
-            Some(elapsed_us),
-        ),
-        // Timeout or decode error: conservative fallback
-        _ => (DecodeCapabilityPolicy::Proxy, Some(elapsed_us)),
+        Ok(Ok(Ok(path))) => match path {
+            DecodeCapabilityProbePath::CpuNv12Fallback => DecodeCapabilityProbe {
+                outcome: DecodeCapabilityProbeOutcome::CpuNv12Fallback,
+                elapsed_us: Some(elapsed_us),
+                detail: Some(
+                    "D3D11VA zero-copy was ineligible; CPU-NV12 remains a full-resolution transport"
+                        .to_string(),
+                ),
+            },
+            DecodeCapabilityProbePath::DxgiZeroCopy
+            | DecodeCapabilityProbePath::CpuNv12Measured => DecodeCapabilityProbe {
+                outcome: DecodeCapabilityProbeOutcome::Measured(
+                    DecodeCapabilityPolicy::from_probe_us(elapsed_us),
+                ),
+                elapsed_us: Some(elapsed_us),
+                detail: None,
+            },
+        },
+        Ok(Ok(Err(error))) => DecodeCapabilityProbe {
+            outcome: DecodeCapabilityProbeOutcome::Failed,
+            elapsed_us: Some(elapsed_us),
+            detail: Some(error),
+        },
+        Ok(Err(error)) => DecodeCapabilityProbe {
+            outcome: DecodeCapabilityProbeOutcome::Failed,
+            elapsed_us: Some(elapsed_us),
+            detail: Some(format!("probe worker failed: {error}")),
+        },
+        Err(error) => DecodeCapabilityProbe {
+            outcome: DecodeCapabilityProbeOutcome::TimedOut,
+            elapsed_us: Some(elapsed_us),
+            detail: Some(format!("probe timed out: {error}")),
+        },
     }
 }
 
@@ -1203,7 +1381,7 @@ pub async fn configure_native_playback_render(
         Ok::<(), String>(())
     };
     let capability_probe = probe_decode_capability(&snapshot_clone);
-    let (pipeline_warmup_result, (capability_policy, capability_probe_us)) =
+    let (pipeline_warmup_result, capability_probe) =
         tokio::join!(pipeline_warmup, capability_probe);
     pipeline_warmup_result?;
     let _ = app.emit(
@@ -1221,15 +1399,35 @@ pub async fn configure_native_playback_render(
     // The probe completed concurrently with GPU warmup. Apply its result
     // before the first lookahead frame is queued, so one session revision
     // still uses a single, deterministic decode scale.
-    // Respect the most conservative constraint between the requested snapshot quality
-    // (from frontend hardware policy) and the measured capability probe.
-    let probe_quality = capability_policy.lookahead_quality();
-    let lookahead_quality = match (snapshot_clone.quality, probe_quality) {
-        (QualityTier::Proxy, _) | (_, QualityTier::Proxy) => QualityTier::Proxy,
-        (QualityTier::Quarter, _) | (_, QualityTier::Quarter) => QualityTier::Quarter,
-        (QualityTier::Half, _) | (_, QualityTier::Half) => QualityTier::Half,
-        _ => QualityTier::Full,
-    };
+    // Respect the most conservative constraint between the requested snapshot
+    // quality (from frontend hardware policy) and a *successful* capability
+    // measurement. Probe failures are diagnostic information, not proof that
+    // the hardware can only sustain proxy quality.
+    let quality_decision = merge_requested_quality_with_probe(
+        snapshot_clone.quality,
+        capability_probe.outcome,
+    );
+    let lookahead_quality = quality_decision.selected;
+
+    log::info!(
+        "[preview-diag][quality] render session quality decision: requested={:?} probe_outcome={} probe_policy={} probe_elapsed_us={:?} probe_limits_us=full<20000,reduced<50000,timeout=400000 selected={:?} reason={} detail={:?} output={}x{} canvas={}x{} mode={:?}",
+        snapshot_clone.quality,
+        capability_probe.outcome.as_str(),
+        capability_probe
+            .outcome
+            .policy()
+            .map(DecodeCapabilityPolicy::as_str)
+            .unwrap_or("none"),
+        capability_probe.elapsed_us,
+        lookahead_quality,
+        quality_decision.reason,
+        capability_probe.detail,
+        output_w,
+        output_h,
+        canvas_w,
+        canvas_h,
+        snapshot_clone.mode,
+    );
 
     // Apply the decision before the worker can start. This keeps the warmup
     // request and the audio-driven refill path on the same quality policy.
@@ -1254,7 +1452,10 @@ pub async fn configure_native_playback_render(
     {
         let arc = preview_state.inner().clone();
         let mut session = arc.lock().await;
-        session.set_capability_probe(capability_policy, capability_probe_us);
+        session.set_capability_probe(
+            capability_probe.outcome.policy(),
+            capability_probe.elapsed_us,
+        );
     }
 
     if should_start {
@@ -1494,6 +1695,74 @@ mod tests {
 
     fn clock(ticks: i64) -> FrameTime {
         FrameTime::new(0, ticks, DEFAULT_TIME_SCALE).unwrap()
+    }
+
+    #[test]
+    fn measured_capability_can_lower_requested_playback_quality() {
+        let decision = merge_requested_quality_with_probe(
+            QualityTier::Full,
+            DecodeCapabilityProbeOutcome::Measured(DecodeCapabilityPolicy::Proxy),
+        );
+
+        assert_eq!(decision.selected, QualityTier::Quarter);
+        assert_eq!(decision.reason, "measured capability is below requested tier");
+    }
+
+    #[test]
+    fn failed_capability_probe_does_not_turn_requested_quality_into_proxy() {
+        let full = merge_requested_quality_with_probe(
+            QualityTier::Full,
+            DecodeCapabilityProbeOutcome::Failed,
+        );
+        let half = merge_requested_quality_with_probe(
+            QualityTier::Half,
+            DecodeCapabilityProbeOutcome::Failed,
+        );
+
+        assert_eq!(full.selected, QualityTier::Full);
+        assert_eq!(half.selected, QualityTier::Half);
+        assert_eq!(
+            full.reason,
+            "probe failed to decode; preserving requested tier"
+        );
+    }
+
+    #[test]
+    fn timed_out_probe_keeps_existing_conservative_policy() {
+        let full = merge_requested_quality_with_probe(
+            QualityTier::Full,
+            DecodeCapabilityProbeOutcome::TimedOut,
+        );
+        let quarter = merge_requested_quality_with_probe(
+            QualityTier::Quarter,
+            DecodeCapabilityProbeOutcome::TimedOut,
+        );
+
+        assert_eq!(full.selected, QualityTier::Quarter);
+        assert_eq!(quarter.selected, QualityTier::Quarter);
+        assert_eq!(
+            full.reason,
+            "probe timed out; applying conservative proxy tier"
+        );
+    }
+
+    #[test]
+    fn dxgi_zero_copy_unavailable_preserves_full_for_cpu_nv12_fallback() {
+        let decision = merge_requested_quality_with_probe(
+            QualityTier::Full,
+            DecodeCapabilityProbeOutcome::CpuNv12Fallback,
+        );
+
+        assert_eq!(decision.selected, QualityTier::Full);
+        assert_eq!(
+            decision.reason,
+            "DXGI zero-copy unavailable; preserving requested tier for CPU-NV12 fallback"
+        );
+        assert!(
+            DecodeCapabilityProbeOutcome::CpuNv12Fallback
+                .policy()
+                .is_none()
+        );
     }
 
     #[test]
